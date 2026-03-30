@@ -302,11 +302,15 @@ def main():
                 "val_acc": val_acc,
                 "args": vars(args),
             }, ckpt_path)
-            logger.info(f"  ★ New best: {val_acc:.2f}% → saved to {ckpt_path}")
+            logger.info(f"  ★ New best: {val_acc:.2f}% -> saved to {ckpt_path}")
 
     writer.close()
     logger.info(f"\nTraining complete. Best Val Acc: {best_acc:.2f}%")
     logger.info(f"TensorBoard: tensorboard --logdir {args.log_dir}")
+    
+    ckpt_path = output_dir / f"{args.model}_final.pth"
+    logger.info(f"Saving final model to {ckpt_path}")
+    torch.save(model.state_dict(), ckpt_path)
 
 
 if __name__ == "__main__":
