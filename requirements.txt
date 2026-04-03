@@ -4,3 +4,5 @@ timm
 albumentations
 tqdm
 tensorboard
+matplotlib
+numpy
