@@ -22,7 +22,11 @@ datasets/
 .vscode/
 .idea/
 
+
 .DS_Store
 Thumbs.db
 
 *.log
+
+eval_results/
+runs/
