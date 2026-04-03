@@ -1,0 +1,682 @@
+================================================================================
+          STRUCTURED PROBABILISTIC PRUNING (SPP) — DOCUMENT CODE
+          Giải thích toàn bộ implementation, lý do thiết kế, và phân tích kết quả
+================================================================================
+
+
+================================================================================
+PHẦN 1: FLOWCHART TỔNG QUAN
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         PIPELINE TỔNG QUAN                                  │
+│                                                                             │
+│  ┌──────────────┐    ┌──────────────────┐    ┌──────────────┐               │
+│  │ Pre-trained   │───>│  SPP Pruning      │───>│  Retrain      │──> Export   │
+│  │ ResNet18      │    │  (Epoch 1~115)    │    │  (10 epochs)  │    Model    │
+│  │ on CIFAR-10   │    │  p: 0 → 1         │    │  p=1 cố định  │             │
+│  └──────────────┘    └──────────────────┘    └──────────────┘               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  FLOWCHART 1 TRAINING ITERATION (Pruning Phase)              │
+│                                                                             │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ Step 7: spp_pruner.step(i)                      │                        │
+│  │  if i % t == 0:                                  │                        │
+│  │    Tính L1 norm → Ranking → Δ(r) → p += Δ       │                        │
+│  │    Nếu p đạt 1.0 → freeze, zero weight vĩnh viễn│                       │
+│  └────────────────────┬───────────────────────────┘                         │
+│                       ▼                                                     │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ Step 8: spp_pruner.apply_pruning_masks()        │                        │
+│  │  Với mỗi filter: g ~ Bernoulli(1-p)             │                        │
+│  │  g=1 → giữ, g=0 → tắt                           │                       │
+│  └────────────────────┬───────────────────────────┘                         │
+│                       ▼                                                     │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ Step 9: spp_pruner.prune_forward()              │                        │
+│  │  W_saved = W.clone()    ← lưu weights gốc       │                       │
+│  │  W = W × mask           ← mask weights           │                       │
+│  └────────────────────┬───────────────────────────┘                         │
+│                       ▼                                                     │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ Step 10a: Forward + Backward                    │                        │
+│  │  logits = model(images)  ← dùng masked weights  │                        │
+│  │  loss.backward()         ← tính gradients        │                       │
+│  └────────────────────┬───────────────────────────┘                         │
+│                       ▼                                                     │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ Step 10b: Restore + Zero grad + Update          │                        │
+│  │  W = W_saved             ← khôi phục gốc        │                        │
+│  │  grad[mask=0] = 0        ← zero masked grads     │                       │
+│  │  optimizer.step()        ← cập nhật W gốc        │                       │
+│  └────────────────────┬───────────────────────────┘                         │
+│                       ▼                                                     │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ Step 11: i += 1                                 │                        │
+│  └────────────────────────────────────────────────┘                         │
+│                                                                             │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ Step 12: Kiểm tra tỷ lệ p=1 ≥ R → dừng?       │                        │
+│  └────────────────────────────────────────────────┘                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  FLOWCHART EVALUATION (mỗi epoch)                           │
+│                                                                             │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ apply_eval_scaling()                            │                        │
+│  │  W_saved = W.clone()                             │                       │
+│  │  W = W × (1-p)     ← dropout-style scaling      │                       │
+│  │  bias = bias × (1-p)                             │                       │
+│  └────────────────────┬───────────────────────────┘                         │
+│                       ▼                                                     │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ model.eval() + forward trên val set             │                        │
+│  └────────────────────┬───────────────────────────┘                         │
+│                       ▼                                                     │
+│  ┌────────────────────────────────────────────────┐                         │
+│  │ restore_weights()                               │                        │
+│  │  W = W_saved         ← khôi phục weights gốc    │                       │
+│  └────────────────────────────────────────────────┘                         │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                  FLOWCHART EXPORT (cuối cùng)                               │
+│                                                                             │
+│  Conv2d(in=64, out=128, 3×3) ──[giữ 64, cắt 64 filters]──>                │
+│     ├─ 1. Tạo Conv2d MỚI(in=64, out=64, 3×3)                              │
+│     ├─ 2. Tạo BatchNorm2d MỚI(64)                                          │
+│     └─ 3. Sửa Conv kế tiếp: in_channels = 64 (thay vì 128)                │
+│                                                                             │
+│  Model cũ: 11.2M params  ──>  Model mới: 5.7M params (giảm ~50%)          │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+
+================================================================================
+PHẦN 2: GIẢI THÍCH CHI TIẾT TỪNG PHẦN CODE
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.1  KHỞI TẠO — SPPPruner.__init__() (spp_pruner.py dòng 37-74)
+────────────────────────────────────────────────────────────────────────────────
+
+Nhận vào:
+  - model: ResNet18 đã pre-trained trên CIFAR-10
+  - pruning_ratio (R): tỷ lệ muốn prune (mặc định 0.5 = cắt 50% filters)
+  - A = 0.05: biên độ tối đa của Δ(r) mỗi lần cập nhật
+  - u = 0.25: kiểm soát độ phẳng của hàm Δ(r)
+  - update_interval (t) = 180: cứ 180 iterations thì cập nhật p
+
+Khởi tạo:
+  - pruning_probs = {} : dictionary lưu xác suất pruning p cho mỗi layer
+  - masks = {}          : binary masks g cho mỗi layer
+  - frozen = {}         : theo dõi filters nào đã p=1 (bị loại vĩnh viễn)
+  - _saved_weights = {} : lưu weights gốc trước khi mask (cho save/restore)
+  - update_count (k) = 0 : đếm số lần cập nhật p
+  - training_iteration (i) = 0 : đếm iteration
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.2  CHỌN LAYERS — _init_weight_groups() (spp_pruner.py dòng 76-137)
+────────────────────────────────────────────────────────────────────────────────
+
+Duyệt tất cả Conv2d trong model. Với mỗi layer, quyết định PRUNE hay SKIP.
+
+SKIP (không prune):
+  - Stem conv (conv đầu tiên, dòng 114-118): thay đổi output ảnh hưởng toàn bộ
+  - Last conv trong BasicBlock (conv2, dòng 104-108): output phải khớp skip connection
+  - Last conv trong Bottleneck (conv3, dòng 99-103): tương tự
+  - Downsample conv (dòng 110-112): nằm trên skip connection path
+
+PRUNE (an toàn):
+  - conv1 trong mỗi BasicBlock: output đi qua BN → ReLU → conv2
+    Nếu cắt vài output filters của conv1, conv2 nhận ít input channels hơn
+    nhưng skip connection KHÔNG bị ảnh hưởng
+
+Với ResNet18, các layers được prune:
+  layer1.0.conv1, layer1.1.conv1, layer2.0.conv1, layer2.1.conv1,
+  layer3.0.conv1, layer3.1.conv1, layer4.0.conv1, layer4.1.conv1
+  → 8 layers, mỗi layer có 64/64/128/128/256/256/512/512 output filters
+
+Mỗi layer: pruning_probs[name] = zeros(num_filters)
+  → Ban đầu tất cả p = 0 (chưa filter nào bị prune)
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.3  TÍNH L1 NORM — _calculate_l1_norm() (spp_pruner.py dòng 139-153)
+────────────────────────────────────────────────────────────────────────────────
+
+Với conv layer có weight shape (N, C, kH, kW):
+  - N = số output filters
+  - C = số input channels
+  - kH, kW = kích thước kernel
+
+L1 norm cho filter thứ i:
+  l1_norm[i] = Σ |W[i, c, h, w]|  (tổng giá trị tuyệt đối)
+             = weight[i].abs().sum()
+
+Code: weight.detach().abs().sum(dim=(1,2,3)).cpu()
+  → detach() để không track gradient
+  → .cpu() để tránh device mismatch khi tính toán ranking
+
+L1 norm lớn → filter quan trọng → ít bị prune
+L1 norm nhỏ → filter ít quan trọng → dễ bị prune
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.4  TÍNH Δ(r) — _compute_delta_increment() (spp_pruner.py dòng 155-233)
+────────────────────────────────────────────────────────────────────────────────
+
+Đây là trái tim của SPP. Hàm này quyết định mỗi filter tăng hay giảm p bao nhiêu.
+
+Bước 1: Loại frozen filters ra khỏi ranking (dòng 179-182)
+  frozen_mask = filters đã có p=1
+  active_mask = filters còn sống
+  num_active = số filters còn sống
+
+Bước 2: Rank các active filters theo L1 norm tăng dần (dòng 188-195)
+  rank 0 = filter có L1 nhỏ nhất (yếu nhất)
+  rank Nc-1 = filter có L1 lớn nhất (mạnh nhất)
+
+Bước 3: Tính R_eff (effective pruning ratio) (dòng 197-204)
+  target_total_pruned = R × tổng_filters
+  remaining_to_prune = target_total_pruned - đã_frozen
+  R_eff = remaining_to_prune / num_active
+
+  Ví dụ: layer có 64 filters, R=0.5, đã frozen 20
+    target = 0.5 × 64 = 32
+    remaining = 32 - 20 = 12
+    R_eff = 12 / 44 = 0.27
+    → Chỉ cần prune thêm 27% trong số filters còn sống
+
+Bước 4: Tính α và N từ constraints (dòng 210-212)
+  α = (log2 - log u) / (R_eff × Nc)
+  N = -log(u) / α
+
+  Với u=0.25, R_eff=0.27, Nc=44:
+    α = (0.693 - (-1.386)) / (0.27 × 44) = 2.079 / 11.88 = 0.175
+    N = 1.386 / 0.175 = 7.92
+
+Bước 5: Tính Δ(r) theo Eqn(3) (dòng 214-226)
+  Nếu rank ≤ N:  Δ = A × e^(-α × rank)     → DƯƠNG → tăng p (dễ bị prune)
+  Nếu rank > N:  Δ = 2uA - A × e^(-α(2N-r)) → ÂM → giảm p (được bảo vệ)
+
+  Tính chất:
+  - Δ(0) = A = 0.05        : filter yếu nhất tăng p nhiều nhất
+  - Δ(R_eff×Nc) = 0         : điểm cân bằng (không tăng không giảm)
+  - Δ(Nc-1) < 0             : filter mạnh nhất giảm p (được bảo vệ)
+
+  Ý nghĩa: Mỗi lần cập nhật, filter yếu tiến gần p=1, filter mạnh tiến gần p=0.
+  Sau nhiều lần cập nhật, R×Nc filters sẽ đạt p=1 và bị loại vĩnh viễn.
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.5  CẬP NHẬT p — update_pruning_probabilities() (spp_pruner.py dòng 235-272)
+────────────────────────────────────────────────────────────────────────────────
+
+Eqn(4): p^{k+1} = clamp(p^k + Δ(r^k), 0, 1)
+
+Code (dòng 252-253):
+  new_probs = torch.clamp(pruning_probs + delta, 0.0, 1.0)
+
+Giữ frozen filters tại p=1 (dòng 256):
+  new_probs[frozen_mask] = 1.0
+
+Freeze filters mới đạt p=1 (dòng 260-272):
+  Khi filter mới chạm p=1:
+  - Đánh dấu vào frozen dict
+  - Zero weights vĩnh viễn: module.weight.data[idx].zero_()
+  - Filter này sẽ KHÔNG BAO GIỜ hồi phục
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.6  KIỂM TRA CẬP NHẬT — step() (spp_pruner.py dòng 274-288)
+────────────────────────────────────────────────────────────────────────────────
+
+Gọi mỗi iteration. Chỉ cập nhật khi: training_iteration % t == 0
+
+  if training_iteration % self.update_interval == 0:
+      for layer_name in self.weight_groups:
+          self.update_pruning_probabilities(layer_name)
+      self.update_count += 1
+
+Với t=180 và ~390 iter/epoch: cập nhật ~2 lần mỗi epoch.
+→ p tăng chậm, model có thời gian thích ứng.
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.7  MC SAMPLING — apply_pruning_masks() (spp_pruner.py dòng 290-311)
+────────────────────────────────────────────────────────────────────────────────
+
+Với mỗi filter: sample g ~ Bernoulli(1-p)
+  - P(g=1) = 1-p → giữ filter
+  - P(g=0) = p   → tắt filter
+
+Code (dòng 299):
+  sampled_masks = torch.bernoulli(1 - probs)
+
+Frozen filters luôn g=0 (dòng 302-303):
+  sampled_masks[self.frozen[layer_name]] = 0.0
+
+Reshape mask: (out_channels,) → (out_channels, 1, 1, 1) để broadcast (dòng 309)
+
+Ví dụ: filter có p=0.3
+  → 30% chance bị tắt, 70% chance hoạt động
+  → Mỗi iteration, filter này có thể ON hoặc OFF ngẫu nhiên
+  → Đây là CƠ CHẾ RECOVERY: filter bị đánh giá sai vẫn có cơ hội hoạt động
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.8  MASK WEIGHTS — prune_forward() (spp_pruner.py dòng 313-331)
+────────────────────────────────────────────────────────────────────────────────
+
+NON-DESTRUCTIVE: lưu weights gốc TRƯỚC khi mask.
+
+Code:
+  _saved_weights[name] = module.weight.data.clone()   # lưu bản gốc
+  module.weight.data = module.weight.data * mask        # áp mask
+
+Tại sao phải non-destructive?
+  → Nếu destructive (weight *= mask), filter bị mask sẽ = 0 vĩnh viễn
+  → Recovery mechanism mất tác dụng: filter không thể "hồi sinh"
+  → SPP trở thành deterministic pruning thông thường
+
+Bias cũng bị mask theo (dòng 329-331):
+  Eqn(2): f((g⊙W)*Z + b) → khi g=0, cả weight lẫn bias đều = 0
+  → Output của filter bị tắt = 0 hoàn toàn
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.9  RESTORE + GRADIENT MASKING (spp_pruner.py dòng 333-358)
+────────────────────────────────────────────────────────────────────────────────
+
+restore_weights() (dòng 333-345):
+  module.weight.data = self._saved_weights[layer_name]
+  → Khôi phục weights gốc SAU backward, TRƯỚC optimizer.step()
+
+  THỨ TỰ RẤT QUAN TRỌNG (train_cifar10_spp.py dòng 232-241):
+    loss.backward()                    # gradients tính trên masked weights
+    spp_pruner.restore_weights()       # khôi phục W gốc
+    spp_pruner.zero_masked_gradients() # zero grad tại mask=0
+    optimizer.step()                   # cập nhật W GỐC
+
+  Nếu restore SAU optimizer.step():
+    optimizer cập nhật W_masked → restore ghi đè → MẤT gradient update!
+    Đây là bug đã từng xảy ra trong code cũ.
+
+zero_masked_gradients() (dòng 347-358):
+  module.weight.grad.data *= mask
+  → Grad tại positions mask=0 bị zero
+  → optimizer.step() không cập nhật weights tại vị trí đó
+  → Paper: "the masked weights are also not updated during back propagations"
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.10  RETRAIN MASKS — apply_final_masks() (spp_pruner.py dòng 360-382)
+────────────────────────────────────────────────────────────────────────────────
+
+Dùng trong retrain phase (sau khi pruning xong).
+Deterministic: KHÔNG sampling.
+
+  final_mask = (probs < 1.0).float()
+  → p=1 → mask=0 (tắt vĩnh viễn)
+  → p<1 → mask=1 (giữ)
+
+Vẫn non-destructive (save/restore) để gradient masking hoạt động.
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.11  EVAL SCALING — apply_eval_scaling() (spp_pruner.py dòng 384-413)
+────────────────────────────────────────────────────────────────────────────────
+
+Vấn đề: Trong training, filter i bị tắt với xác suất p_i.
+BN running stats phản ánh phân phối CÓ mask.
+Khi eval KHÔNG mask → phân phối khác → BN normalize sai → accuracy rớt.
+
+Giải pháp (giống dropout test-time scaling):
+  W_eval[i] = W[i] × (1 - p_i)
+  bias_eval[i] = bias[i] × (1 - p_i)
+
+Lý do toán học:
+  Trong training:  E[output_i] = (1-p_i) × (W_i × x + b_i)
+    (vì filter i active với xác suất 1-p_i, inactive cho 0)
+  Khi eval với scaling:  output_i = (1-p_i) × (W_i × x + b_i)
+  → Hai giá trị match → BN stats chính xác → accuracy đúng.
+
+Ví dụ:
+  Filter có p=0.7 → scale = 0.3
+  Training: BN thấy output trung bình = 0.3 × giá trị thật
+  Eval (có scaling): output = 0.3 × giá trị thật → MATCH
+  Eval (không scaling): output = 1.0 × giá trị thật → gấp 3.3x → BN lệch
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.12  ĐIỀU KIỆN DỪNG — should_stop_pruning() (spp_pruner.py dòng 415-430)
+────────────────────────────────────────────────────────────────────────────────
+
+  total_groups = tổng số filters trên tất cả prunable layers
+  pruned_groups = số filters có p = 1.0
+  current_ratio = pruned_groups / total_groups
+  → Dừng khi current_ratio ≥ R
+
+
+────────────────────────────────────────────────────────────────────────────────
+2.13  EXPORT MODEL — export_pruned_model() (spp_pruner.py dòng 450-497)
+────────────────────────────────────────────────────────────────────────────────
+
+LOẠI BỎ HOÀN TOÀN filters có p=1 — không phải nhân 0, mà tạo model MỚI.
+
+Với mỗi prunable conv:
+  1. Tạo Conv2d MỚI với ít out_channels hơn (dòng 525-538)
+     Conv2d(64→128) → Conv2d(64→64) nếu prune 50%
+
+  2. Tạo BatchNorm2d MỚI match số channels (dòng 543-552)
+     BN2d(128) → BN2d(64)
+
+  3. Sửa Conv kế tiếp: giảm in_channels (dòng 555-580)
+     Conv2d(128→128) → Conv2d(64→128)
+
+Kết quả: model nhỏ hơn thật sự, chạy nhanh hơn trên hardware thường.
+
+
+================================================================================
+PHẦN 3: TRAINING LOOP (train_cifar10_spp.py)
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+3.1  PRUNING PHASE (dòng 211-223)
+────────────────────────────────────────────────────────────────────────────────
+
+Mỗi iteration:
+  spp_pruner.step(i)             # cập nhật p nếu i % t == 0
+  spp_pruner.apply_pruning_masks()  # MC sampling masks
+  spp_pruner.prune_forward()     # save + mask weights
+
+→ Forward với masked weights
+→ Backward tính gradients
+→ Restore weights gốc
+→ Zero masked gradients
+→ Optimizer step cập nhật weights gốc
+→ i += 1
+
+────────────────────────────────────────────────────────────────────────────────
+3.2  RETRAIN PHASE (dòng 224-226, 489-516)
+────────────────────────────────────────────────────────────────────────────────
+
+Khi tỷ lệ p=1 đạt R:
+  → Chuyển sang retrain
+  → Dùng apply_final_masks() (deterministic, chỉ p=1 bị tắt)
+  → Train thêm 10 epochs để model hồi phục accuracy
+
+────────────────────────────────────────────────────────────────────────────────
+3.3  EVALUATE (dòng 272-309)
+────────────────────────────────────────────────────────────────────────────────
+
+  apply_eval_scaling()  → W *= (1-p), bias *= (1-p)
+  forward trên val set
+  restore_weights()     → khôi phục W gốc
+
+
+================================================================================
+PHẦN 4: LÝ DO CHỌN CÁCH NÀY THAY VÌ 100% PAPER
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+4.1  FILTER PRUNING thay vì COLUMN PRUNING
+────────────────────────────────────────────────────────────────────────────────
+
+Paper: prune "columns" (shape sparsity) — zero 1 vị trí (c,kh,kw) qua tất cả
+       output filters. Model giữ nguyên kiến trúc, chỉ có sparse weights.
+
+Code:  prune "filters" (row sparsity) — loại bỏ cả output filter.
+       Model THẬT SỰ nhỏ hơn (ít channels).
+
+Lý do:
+  1. Column pruning KHÔNG THỂ tạo model nhỏ hơn (vẫn giữ nguyên Conv2d shape)
+     → Chỉ có sparse weights, cần hardware đặc biệt để tăng tốc
+     → Trên GPU/CPU thông thường, không có actual speedup
+
+  2. Filter pruning TẠO model mới với ít channels
+     → Conv2d(64→128) → Conv2d(64→64) : thật sự ít tham số hơn
+     → Chạy nhanh hơn ngay trên mọi hardware
+     → Dễ deploy, dễ đo speedup
+
+  3. Kết quả thực tế (từ file resnet18_2.csv):
+     - Size giảm 1.97x (gần 2x)
+     - Param giảm 1.97x
+     - Accuracy chỉ giảm 1.76%
+     → Trade-off tốt: giảm gần nửa model với accuracy drop nhỏ
+
+
+────────────────────────────────────────────────────────────────────────────────
+4.2  SKIP LAYERS cho ResNet
+────────────────────────────────────────────────────────────────────────────────
+
+Paper: prune TẤT CẢ conv layers (không skip).
+Code:  skip stem conv, last conv trong block, downsample conv.
+
+Lý do: ResNet có SKIP CONNECTIONS.
+
+  Trong BasicBlock:
+    x ──→ conv1 ──→ BN1 ──→ ReLU ──→ conv2 ──→ BN2 ──→ (+) ──→ ReLU
+    │                                                      ↑
+    └──────────────────── shortcut ─────────────────────────┘
+
+  conv2 output phải cùng shape với shortcut (x).
+  Nếu prune conv2 (giảm out_channels) → shape mismatch → model hỏng.
+
+  Tương tự:
+  - Stem conv: thay đổi output ảnh hưởng TOÀN BỘ model
+  - Downsample conv: nằm trên skip connection path
+
+  Paper dùng AlexNet/VGG (không có skip connection) nên không gặp vấn đề.
+  Với ResNet-50, paper nói prune tất cả layers nhưng dùng COLUMN pruning
+  (không thay đổi output dimension) nên skip connection vẫn OK.
+  Code dùng FILTER pruning → PHẢI skip để bảo vệ skip connections.
+
+
+────────────────────────────────────────────────────────────────────────────────
+4.3  FROZEN TRACKING + R_eff RANKING
+────────────────────────────────────────────────────────────────────────────────
+
+Paper: rank tất cả Nc groups, dùng R × Nc làm cutoff.
+Code:  loại frozen groups khỏi ranking, dùng R_eff × Nc_active.
+
+Lý do: Khi filters bị frozen (p=1, weights=0):
+  - L1 norm = 0 → luôn chiếm rank 0, 1, 2...
+  - Đẩy lệch rank của active filters
+  - Active filter yếu nhất bị "đẩy lên" rank cao hơn → nhận Δ nhỏ hơn
+  - Hệ quả: thuật toán chậm hội tụ
+
+  Ví dụ: layer 64 filters, R=0.5, đã frozen 20
+    Paper ranking:  rank 0-19 = frozen (L1=0), rank 20 = active yếu nhất
+      → active yếu nhất ở rank 20, nhận Δ(20) thay vì Δ(0) → nhỏ hơn nhiều
+
+    Code ranking:   chỉ rank 44 active filters
+      → active yếu nhất ở rank 0, nhận Δ(0) → đúng giá trị
+      → Hội tụ nhanh hơn, chính xác hơn
+
+
+────────────────────────────────────────────────────────────────────────────────
+4.4  NON-DESTRUCTIVE MASKING (save/restore)
+────────────────────────────────────────────────────────────────────────────────
+
+Paper: không đề cập chi tiết implementation.
+Code:  lưu weights trước mask, khôi phục sau backward.
+
+Lý do: RECOVERY MECHANISM — trái tim của SPP.
+  Paper: "some initially unimportant weights may become important later"
+  → Weights phải được BẢO TỒN để khi p giảm, filter có thể "hồi sinh"
+  → Nếu destructive (weight *= mask), weights = 0 vĩnh viễn → không hồi phục
+
+
+────────────────────────────────────────────────────────────────────────────────
+4.5  EVAL SCALING (dropout-style)
+────────────────────────────────────────────────────────────────────────────────
+
+Paper: không đề cập cách evaluate trong quá trình pruning.
+Code:  scale weights bằng (1-p) khi eval.
+
+Lý do: BATCHNORM MISMATCH.
+  Trong training: filter i bị tắt với xác suất p_i
+  → BN running stats phản ánh phân phối CÓ filters bị tắt
+  → Khi eval KHÔNG mask: phân phối khác → BN normalize sai → accuracy rớt
+
+  Giải pháp giống dropout:
+  - Dropout training: activation × Bernoulli(1-p), BN learns E[act] = (1-p)×act
+  - Dropout eval: activation × (1-p) → match BN stats
+  - SPP training: weight × Bernoulli(1-p), BN learns E[output] = (1-p)×output
+  - SPP eval: weight × (1-p) → match BN stats
+
+
+────────────────────────────────────────────────────────────────────────────────
+4.6  GRADIENT MASKING
+────────────────────────────────────────────────────────────────────────────────
+
+Paper: "the masked weights are also not updated during back propagations"
+Code:  zero_masked_gradients() sau backward, trước optimizer.step()
+
+  Lý do: Đảm bảo optimizer KHÔNG cập nhật weights tại vị trí mask=0.
+  Nếu không zero: optimizer (đặc biệt Adam) duy trì momentum từ iterations
+  trước → vẫn apply update nhỏ cho masked positions → weights bị drift.
+
+
+================================================================================
+PHẦN 5: PHÂN TÍCH KẾT QUẢ TỪ ẢNH accuracy.png
+================================================================================
+
+
+Quan sát từ đồ thị:
+
+  ┌───────────────────────────────────────────────────────────────────────────┐
+  │ Train Acc (xanh): bắt đầu ~95%, giảm nhẹ rồi tăng dần lên ~98%         │
+  │ Val Acc (cam):    bắt đầu ~87%, rớt mạnh xuống ~13% rồi hồi phục ~86%  │
+  │ Đường đỏ:        epoch ~115 = pruning kết thúc → retrain bắt đầu        │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.1  TẠI SAO TRAIN ACC CAO NHƯNG VAL ACC THẤP (epoch 5-45)?
+────────────────────────────────────────────────────────────────────────────────
+
+Train accuracy tính TRONG LÚC forward với MASKED weights.
+  → Model "nhìn thấy" bài toán dễ hơn (ít filters hoạt động, ít noise)
+  → Overfitting trên phần filters còn sống
+
+Val accuracy tính với EVAL SCALING: W × (1-p).
+  → Scale factor (1-p) làm giảm magnitude của weights
+  → Khi nhiều filters có p cao (0.3-0.7), scaling mạnh → features yếu
+  → BN stats từ training (với binary mask ON/OFF) khác với eval scaling
+     (smooth scaling) → mismatch → accuracy rớt
+
+GAP lớn nhất ở epoch 10-30: đây là giai đoạn p tăng nhanh nhất.
+  - Từ pruning_ratio.png: epoch 10-30 là giai đoạn pruning tăng từ 0% → 35%
+  - Nhiều filters có p trung bình (0.3-0.7) → scaling mismatch lớn nhất
+  - Sau epoch 50: hầu hết filters hoặc p=0 hoặc p=1 → scaling = 1 hoặc 0
+    → ít mismatch hơn → val acc ổn định
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.2  TẠI SAO VAL ACC "SPIKES" XUỐNG RỒI LÊN (epoch 5-45)?
+────────────────────────────────────────────────────────────────────────────────
+
+Các đợt rớt mạnh (xuống ~13%, ~20%, ~30%) tương ứng với:
+  → Thời điểm NHIỀU filters mới bị frozen (p đạt 1.0)
+  → Model mất đột ngột nhiều filters → features bị phá hủy
+  → Nhưng sau vài epochs, model thích ứng → accuracy phục hồi
+
+Cơ chế phục hồi:
+  1. Filters còn sống (p<1) được train mạnh hơn (nhận tất cả gradients)
+  2. Recovery mechanism: filters có p cao nhưng <1 có thể giảm p nếu trở
+     nên quan trọng hơn (do filters khác bị loại)
+  3. Còn lại filters mạnh nhất → dần dần đủ capacity → accuracy hồi phục
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.3  TẠI SAO VAL ACC ỔN ĐỊNH SAU EPOCH 50?
+────────────────────────────────────────────────────────────────────────────────
+
+Từ pruning_ratio.png: sau epoch 50, hầu hết layers đã đạt ~50% pruning.
+  → Phần lớn filters hoặc p=0 (active, scale=1) hoặc p=1 (frozen, scale=0)
+  → Rất ít filters ở trạng thái trung gian (0<p<1)
+  → Eval scaling (1-p) gần như binary → match tốt với training masks
+  → Val acc ổn định ~85-86%
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.4  TẠI SAO RETRAIN KHÔNG CẢI THIỆN NHIỀU?
+────────────────────────────────────────────────────────────────────────────────
+
+Đường đỏ (epoch ~115): bắt đầu retrain.
+Val acc trước retrain: ~86%
+Val acc sau retrain: ~86%
+→ Gần như không thay đổi.
+
+Lý do:
+  1. Model đã ổn định từ epoch 50-115 (65 epochs training đầy đủ)
+  2. Retrain chỉ thêm 10 epochs — quá ít so với 65 epochs đã train
+  3. Filters đã frozen → model đã thích ứng với architecture nhỏ hơn
+  4. Retrain chủ yếu fine-tune nhẹ, không thay đổi nhiều
+
+  Nếu muốn cải thiện: tăng spp-retrain-epochs (20-50 epochs)
+  hoặc reset learning rate cho retrain phase.
+
+
+────────────────────────────────────────────────────────────────────────────────
+5.5  VAL ACC CUỐI (~86%) SO VỚI BASELINE (~88%)?
+────────────────────────────────────────────────────────────────────────────────
+
+Từ resnet18_2.csv: accuracy drop = 1.76%
+  Baseline: ~88%
+  Sau pruning: ~86%
+  Đổi lại: giảm ~50% params và model size
+
+Đây là trade-off chấp nhận được:
+  - Paper báo cáo ResNet-50 2x speedup chỉ giảm 0.8% top-5 trên ImageNet
+  - Code đạt ~2x size reduction với 1.76% accuracy drop trên CIFAR-10
+  - Phù hợp với kỳ vọng của phương pháp SPP
+
+
+================================================================================
+PHẦN 6: TÓM TẮT CÁC THAY ĐỔI SO VỚI PAPER
+================================================================================
+
+┌─────────────────────┬────────────────────────┬───────────────────────────────┐
+│ Khía cạnh            │ Paper                  │ Code (lý do)                 │
+├─────────────────────┼────────────────────────┼───────────────────────────────┤
+│ Weight group         │ Column (shape)         │ Filter (row) → export được   │
+│ Layer selection      │ Tất cả conv            │ Skip unsafe → bảo vệ ResNet  │
+│ Ranking              │ Tất cả Nc groups       │ Loại frozen → ranking chính  │
+│                      │                        │   xác hơn                    │
+│ R trong Δ(r)         │ R cố định              │ R_eff → adapt khi có frozen  │
+│ Mask mechanism       │ Không nói rõ           │ Non-destructive save/restore │
+│                      │                        │   → recovery mechanism hoạt  │
+│                      │                        │   động                       │
+│ Gradient masking     │ "not updated"          │ zero_masked_gradients() →    │
+│                      │                        │   explicit implementation    │
+│ Eval scaling         │ Không đề cập           │ (1-p) scaling → fix BN       │
+│                      │                        │   mismatch                   │
+│ Export               │ Logical pruned model   │ Physical smaller model →     │
+│                      │                        │   actual speedup             │
+│ Frozen tracking      │ Không đề cập           │ frozen dict → permanent      │
+│                      │                        │   removal + weight zeroing   │
+└─────────────────────┴────────────────────────┴───────────────────────────────┘
+
+Tất cả thay đổi đều nhằm mục đích:
+  1. Làm cho SPP hoạt động ĐÚNG trên ResNet (skip connections)
+  2. Tạo model THẬT SỰ nhỏ hơn (filter pruning + structural export)
+  3. Fix các vấn đề thực tế paper không đề cập (BN mismatch, gradient masking)
+  4. Tối ưu hội tụ (R_eff ranking)
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
