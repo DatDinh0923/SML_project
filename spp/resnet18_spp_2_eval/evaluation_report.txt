@@ -1,0 +1,41 @@
+======================================================================
+CIFAR-10 MODEL EVALUATION REPORT
+======================================================================
+
+MODEL INFORMATION:
+----------------------------------------------------------------------
+Architecture: resnet18
+Checkpoint: ./checkpoints/resnet18_spp_final.pth
+Total Parameters: 5,686,986
+Trainable Parameters: 5,686,986
+Model Size (fp32): 21.69 MB
+Conv Layers: 20
+Linear Layers: 1
+FLOPs: 0.02 GFLOPs
+
+ACCURACY METRICS:
+----------------------------------------------------------------------
+Overall Accuracy: 85.73%
+Correct Predictions: 8573
+Total Test Samples: 10000
+
+INFERENCE PERFORMANCE:
+----------------------------------------------------------------------
+Average Batch Time: 9.73 ms
+Time per Sample: 0.0010 ms
+Total Inference Time: 0.39 seconds
+Samples per Second: 25686.02
+
+PER-CLASS ACCURACY:
+----------------------------------------------------------------------
+automobile  : 93.10% (931/1000)
+frog        : 92.90% (929/1000)
+ship        : 92.80% (928/1000)
+truck       : 90.30% (903/1000)
+deer        : 88.40% (884/1000)
+airplane    : 88.00% (880/1000)
+horse       : 86.90% (869/1000)
+bird        : 81.60% (816/1000)
+dog         : 73.10% (731/1000)
+cat         : 70.20% (702/1000)
+
