@@ -31,8 +31,8 @@ NUM_CLASSES = 10
 def parse_args():
     p = argparse.ArgumentParser(description="Train on CIFAR-10 with CNNs")
 
-    p.add_argument("--model", type=str, default="resnet18",
-                   help="timm model name (default: resnet18)")
+    p.add_argument("--model", type=str, default="resnet50",
+                   help="timm model name (default: resnet50)")
     p.add_argument("--drop-rate", type=float, default=0.0)
     p.add_argument("--drop-path-rate", type=float, default=0.0)  # Stochastic depth
 
@@ -41,19 +41,19 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--pin-memory", action="store_true", default=True)
 
-    p.add_argument("--epochs", type=int, default=200)
+    p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--lr", type=float, default=0.1,
+    p.add_argument("--lr", type=float, default=1e-3,
                    help="Base learning rate (default: 0.1 for SGD, use ~1e-3 for AdamW)")
-    p.add_argument("--opt", type=str, default="sgd", choices=["sgd", "adamw"],
-                   help="Optimizer (default: sgd)")
+    p.add_argument("--opt", type=str, default="adamw", choices=["sgd", "adamw"],
+                   help="Optimizer (default: adamw)")
     p.add_argument("--momentum", type=float, default=0.9)
     p.add_argument("--weight-decay", type=float, default=5e-4)
     p.add_argument("--warmup-epochs", type=int, default=5)
     p.add_argument("--min-lr", type=float, default=1e-6)
     p.add_argument("--label-smoothing", type=float, default=0.0)
 
-    p.add_argument("--seed", type=int, default=1101)
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--output-dir", type=str, default="./checkpoints")
     p.add_argument("--log-dir", type=str, default="./runs",
                    help="TensorBoard log directory")
@@ -307,7 +307,7 @@ def main():
     writer.close()
     logger.info(f"\nTraining complete. Best Val Acc: {best_acc:.2f}%")
     logger.info(f"TensorBoard: tensorboard --logdir {args.log_dir}")
-    
+
     ckpt_path = output_dir / f"{args.model}_final.pth"
     logger.info(f"Saving final model to {ckpt_path}")
     torch.save(model.state_dict(), ckpt_path)
