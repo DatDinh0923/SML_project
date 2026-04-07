@@ -6,3 +6,5 @@ tqdm
 tensorboard
 matplotlib
 numpy
+fvcore
+seaborn
